@@ -2,15 +2,27 @@ import json
 import os
 import logging
 import requests
+import traceback
 from groq import Groq
 
 # Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Configuration
-MCP_SERVER_URL = os.environ.get("MCP_LAMBDA_URL")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+def load_environment_config():
+    """Load configuration from environment.json"""
+    try:
+        with open(
+            os.path.join(os.path.dirname(__file__), "environment.json"), "r"
+        ) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load environment.json: {e}")
+        return {}
+
+
+ENV_CONFIG = load_environment_config()
 
 
 class MCPClient:
@@ -76,21 +88,10 @@ def lambda_handler(event, context):
     """
     AWS Lambda Handler for the MCP Client.
     Expected Input:
-      - {"message": "User query"}
+      - {"message": "User query", "model": "...", "mcpmaper": "..."}
       OR
-      - {"messages": [{"role": "user", "content": "..."}]}
+      - {"messages": [...], "model": "...", "mcpmaper": "..."}
     """
-    if not GROQ_API_KEY:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"error": "GROQ_API_KEY missing"}),
-        }
-    if not MCP_SERVER_URL:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"error": "MCP_LAMBDA_URL missing"}),
-        }
-
     try:
         # Parse input
         body = event
@@ -100,44 +101,105 @@ def lambda_handler(event, context):
             else:
                 body = event["body"]
 
-        # Determine messages items
+        # Extract parameters
+        model_key = body.get("model")
+        mapper_key = body.get("mcpmaper")
+        user_prompt = body.get("prompt") or body.get("message")
+
+        # Validate Input
+        if not model_key or not mapper_key or not user_prompt:
+            return {
+                "statusCode": 400,
+                "body": json.dumps(
+                    {"error": "Missing required fields: prompt, model, mcpmaper"}
+                ),
+            }
+
+        # Resolve Configuration
+        ai_models = ENV_CONFIG.get("aiModels", {})
+        mcp_mapper = ENV_CONFIG.get("mcpMapper", {})
+
+        if model_key not in ai_models:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": f"Invalid model key: {model_key}"}),
+            }
+        if mapper_key not in mcp_mapper:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": f"Invalid mcpmaper key: {mapper_key}"}),
+            }
+
+        # Get Model Config
+        model_config = ai_models[model_key]
+        api_key = model_config.get("apiKey")
+        model_name = model_config.get("model")
+
+        # Get MCP URL (handle list or string)
+        mcp_url_entry = mcp_mapper[mapper_key]
+        mcp_server_url = (
+            mcp_url_entry[0] if isinstance(mcp_url_entry, list) else mcp_url_entry
+        )
+
+        if not api_key:
+            return {
+                "statusCode": 500,
+                "body": json.dumps(
+                    {"error": f"API Key not found for model: {model_key}"}
+                ),
+            }
+        if not mcp_server_url:
+            return {
+                "statusCode": 500,
+                "body": json.dumps(
+                    {"error": f"MCP URL not found for mapper: {mapper_key}"}
+                ),
+            }
+
+        # Prepare Messages
         messages = body.get("messages")
         if not messages:
-            user_message = body.get("message") or body.get("prompt")
-            if not user_message:
-                return {
-                    "statusCode": 400,
-                    "body": json.dumps(
-                        {"error": "No 'message', 'prompt', or 'messages' provided"}
-                    ),
-                }
-
             messages = [
                 {
                     "role": "system",
                     "content": "You are a helpful assistant with access to property tools.",
                 },
-                {"role": "user", "content": user_message},
+                {"role": "user", "content": user_prompt},
             ]
 
         # Initialize Clients
-        mcp_client = MCPClient(MCP_SERVER_URL)
-        groq_client = Groq(api_key=GROQ_API_KEY)
+        mcp_client = MCPClient(mcp_server_url)
+
+        # Select Provider Client
+        if "groq" in model_key.lower():
+            client = Groq(api_key=api_key)
+        else:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=api_key)
 
         # Get Tools
         mcp_tools = mcp_client.list_tools()
-        groq_tools = [convert_to_groq_tool(t) for t in mcp_tools]
+        llm_tools = [convert_to_groq_tool(t) for t in mcp_tools]
 
-        # 1. Call Groq
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        # 1. Call LLM
+        response = client.chat.completions.create(
+            model=model_name,
             messages=messages,
-            tools=groq_tools,
+            tools=llm_tools,
             tool_choice="auto",
         )
 
         response_message = response.choices[0].message
-        messages.append(response_message)
+
+        # Convert to dict for safety if it's an object
+        msg_dict = response_message
+        if hasattr(response_message, "model_dump"):
+            msg_dict = response_message.model_dump()
+        elif hasattr(response_message, "to_dict"):
+            msg_dict = response_message.to_dict()
+
+        messages.append(msg_dict)
 
         # 2. Handle Tool Calls (if any)
         if response_message.tool_calls:
@@ -158,8 +220,31 @@ def lambda_handler(event, context):
                 )
 
             # 3. Final Answer
-            final_response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile", messages=messages
+
+            # Sanitize messages for Groq/Llama quirks
+            final_messages = []
+            allowed_keys = {"role", "content", "tool_calls", "tool_call_id", "name"}
+
+            for m in messages:
+                # Create a strict copy with only allowed keys
+                msg = {
+                    k: v for k, v in m.items() if k in allowed_keys and v is not None
+                }
+
+                # Special handling for Assistant messages with tool calls
+                if msg.get("role") == "assistant":
+                    if msg.get("tool_calls"):
+                        # Ensure content is string (even if empty) if tool_calls exist
+                        if "content" not in msg or msg["content"] is None:
+                            msg["content"] = ""
+                    else:
+                        # Remove tool_calls if empty/None
+                        msg.pop("tool_calls", None)
+
+                final_messages.append(msg)
+
+            final_response = client.chat.completions.create(
+                model=model_name, messages=final_messages, tools=llm_tools
             )
             final_content = final_response.choices[0].message.content
         else:
@@ -178,5 +263,8 @@ def lambda_handler(event, context):
         }
 
     except Exception as e:
-        logger.error(f"Handler failed: {str(e)}")
+        logger.error(f"!!! ERROR DETAILS: {str(e)}")
+        if hasattr(e, "response") and hasattr(e.response, "text"):
+            logger.error(f"!!! API RESPONSE: {e.response.text}")
+        traceback.print_exc()
         return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
