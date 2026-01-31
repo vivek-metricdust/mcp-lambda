@@ -5,8 +5,12 @@
 Run the interactive CLI client locally to test against the deployed Server:
 
 ```bash
-# Install dependencies first
-pip install requests groq python-dotenv
+# Create and activate virtual environment (Windows)
+python -m venv .venv
+.\.venv\Scripts\Activate
+
+# Install dependencies
+pip install -r requirements.txt
 
 # Run the client
 python mcp_client.py

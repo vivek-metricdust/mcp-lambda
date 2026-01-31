@@ -1,4 +1,6 @@
-.env
-__pycache__/
+*.env
 *.zip
 package/
+*__pycache__
+*__pycache__*
+*.venv
