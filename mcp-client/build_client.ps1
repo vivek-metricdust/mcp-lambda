@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Path $packageDir | Out-Null
 # 2. Install dependencies (Targeting Linux x86_64 for Lambda)
 # Note: AWS Lambda needs Linux compatible wheels. We use pip with platform flags.
 Write-Host "Installing dependencies for Lambda (Linux x86_64)..."
-pip install --target $packageDir --platform manylinux2014_x86_64 --only-binary=:all: --implementation cp --python-version 3.12 --upgrade requests groq python-dotenv
+pip install --target $packageDir --platform manylinux2014_x86_64 --only-binary=:all: --implementation cp --python-version 3.12 --upgrade requests groq openai python-dotenv
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to install dependencies."
@@ -27,6 +27,7 @@ if ($LASTEXITCODE -ne 0) {
 # 3. Copy lambda function
 Write-Host "Copying client code..."
 Copy-Item "client_lambda.py" -Destination (Join-Path $packageDir "lambda_function.py")
+Copy-Item "environment.json" -Destination $packageDir
 
 # 4. Create ZIP
 Write-Host "Creating zip package..."
